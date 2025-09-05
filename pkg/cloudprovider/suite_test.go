@@ -17,7 +17,6 @@ package cloudprovider_test
 import (
 	"context"
 	"fmt"
-	"net"
 	"strings"
 	"testing"
 	"time"
@@ -108,9 +107,6 @@ var _ = BeforeEach(func() {
 
 	cluster.Reset()
 	awsEnv.Reset()
-
-	awsEnv.LaunchTemplateProvider.KubeDNSIP = net.ParseIP("10.0.100.10")
-	awsEnv.LaunchTemplateProvider.ClusterEndpoint = "https://test-cluster"
 })
 
 var _ = AfterEach(func() {
@@ -231,9 +227,9 @@ var _ = Describe("CloudProvider", func() {
 		})
 		version := awsEnv.VersionProvider.Get(ctx)
 		awsEnv.SSMAPI.Parameters = map[string]string{
-			fmt.Sprintf("/aws/service/eks/optimized-ami/%s/amazon-linux-2/recommended/image_id", version):       "amd64-ami-id",
-			fmt.Sprintf("/aws/service/eks/optimized-ami/%s/amazon-linux-2-gpu/recommended/image_id", version):   "amd64-nvidia-ami-id",
-			fmt.Sprintf("/aws/service/eks/optimized-ami/%s/amazon-linux-2-arm64/recommended/image_id", version): "arm64-ami-id",
+			fmt.Sprintf("/aws/service/eks/optimized-ami/%s/amazon-linux-2023/x86_64/standard/recommended/image_id", version): "amd64-ami-id",
+			fmt.Sprintf("/aws/service/eks/optimized-ami/%s/amazon-linux-2023/x86_64/nvidia/recommended/image_id", version):   "amd64-nvidia-ami-id",
+			fmt.Sprintf("/aws/service/eks/optimized-ami/%s/amazon-linux-2023/arm64/standard/recommended/image_id", version):  "arm64-ami-id",
 		}
 	})
 	It("should not proceed with instance creation if NodeClass is unknown", func() {
@@ -254,6 +250,15 @@ var _ = Describe("CloudProvider", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClass, nodeClaim)
 		nodeClass.Spec.Tags = map[string]string{"kubernetes.io/cluster/thewrongcluster": "owned"}
 		ExpectApplied(ctx, env.Client, nodeClass)
+		_, err := cloudProvider.Create(ctx, nodeClaim)
+		Expect(err).To(HaveOccurred())
+		Expect(corecloudprovider.IsNodeClassNotReadyError(err)).To(BeTrue())
+	})
+	It("should return NodeClassNotReady error when observed generation doesn't match", func() {
+		nodeClass.Generation = 2
+		nodeClass.StatusConditions().SetTrue(opstatus.ConditionReady)
+		nodeClass.StatusConditions().Get(opstatus.ConditionReady).ObservedGeneration = 1
+		ExpectApplied(ctx, env.Client, nodePool, nodeClass, nodeClaim)
 		_, err := cloudProvider.Create(ctx, nodeClaim)
 		Expect(err).To(HaveOccurred())
 		Expect(corecloudprovider.IsNodeClassNotReadyError(err)).To(BeTrue())
@@ -301,8 +306,9 @@ var _ = Describe("CloudProvider", func() {
 		cloudProviderNodeClaim, err := cloudProvider.Create(ctx, nodeClaim)
 		Expect(err).To(BeNil())
 		Expect(cloudProviderNodeClaim).ToNot(BeNil())
-		Expect(len(lo.Keys(cloudProviderNodeClaim.Annotations))).To(BeNumerically("==", 2))
-		Expect(lo.Keys(cloudProviderNodeClaim.Annotations)).To(ContainElements(v1.AnnotationEC2NodeClassHash, v1.AnnotationEC2NodeClassHashVersion))
+		Expect(len(lo.Keys(cloudProviderNodeClaim.Annotations))).To(BeNumerically("==", 3))
+		Expect(lo.Keys(cloudProviderNodeClaim.Annotations)).To(ContainElements(v1.AnnotationEC2NodeClassHash, v1.AnnotationEC2NodeClassHashVersion, v1.AnnotationInstanceProfile))
+		Expect(cloudProviderNodeClaim.Annotations[v1.AnnotationInstanceProfile]).To(Equal(nodeClass.Status.InstanceProfile))
 	})
 	It("should return NodeClass Hash on the nodeClaim", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClass, nodeClaim)
@@ -332,6 +338,19 @@ var _ = Describe("CloudProvider", func() {
 			Expect(awsEnv.EC2API.CreateFleetBehavior.CalledWithInput.Len()).To(Equal(1))
 			createFleetInput := awsEnv.EC2API.CreateFleetBehavior.CalledWithInput.Pop()
 			Expect(aws.ToString(createFleetInput.Context)).To(Equal(contextID))
+		})
+		It("should not set context on the CreateFleet request when min values are relaxed even if specified on the NodePool", func() {
+			nodeClass.Spec.Context = aws.String(contextID)
+			nodeClaimWithRelaxedMinValues := nodeClaim.DeepCopy()
+			nodeClaimWithRelaxedMinValues.Annotations = lo.Assign(nodeClaimWithRelaxedMinValues.Annotations, map[string]string{karpv1.NodeClaimMinValuesRelaxedAnnotationKey: "true"})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClass, nodeClaimWithRelaxedMinValues)
+			cloudProviderNodeClaim, err := cloudProvider.Create(ctx, nodeClaimWithRelaxedMinValues)
+			Expect(err).To(BeNil())
+			Expect(cloudProviderNodeClaim).ToNot(BeNil())
+
+			Expect(awsEnv.EC2API.CreateFleetBehavior.CalledWithInput.Len()).To(Equal(1))
+			createFleetInput := awsEnv.EC2API.CreateFleetBehavior.CalledWithInput.Pop()
+			Expect(aws.ToString(createFleetInput.Context)).To(BeEmpty())
 		})
 		It("should default to no EC2 Context", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClass)
@@ -797,6 +816,7 @@ var _ = Describe("CloudProvider", func() {
 				v1.AnnotationEC2NodeClassHashVersion: v1.EC2NodeClassHashVersion,
 			})
 			nodeClaim.Status.ProviderID = fake.ProviderID(lo.FromPtr(instance.InstanceId))
+			nodeClaim.Status.ImageID = amdAMIID
 			nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
 				v1.AnnotationEC2NodeClassHash:        nodeClass.Hash(),
 				v1.AnnotationEC2NodeClassHashVersion: v1.EC2NodeClassHashVersion,
@@ -816,11 +836,7 @@ var _ = Describe("CloudProvider", func() {
 			Expect(drifted).To(BeEmpty())
 		})
 		It("should return drifted if the AMI is not valid", func() {
-			// Instance is a reference to what we return in the GetInstances call
-			instance.ImageId = aws.String(fake.ImageID())
-			awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(&ec2.DescribeInstancesOutput{
-				Reservations: []ec2types.Reservation{{Instances: []ec2types.Instance{instance}}},
-			})
+			nodeClaim.Status.ImageID = fake.ImageID()
 			isDrifted, err := cloudProvider.IsDrifted(ctx, nodeClaim)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(isDrifted).To(Equal(cloudprovider.AMIDrift))
@@ -915,11 +931,17 @@ var _ = Describe("CloudProvider", func() {
 					InstanceMatchCriteria: string(ec2types.InstanceMatchCriteriaTargeted),
 					InstanceType:          "m5.large",
 					OwnerID:               "012345678901",
+					State:                 v1.CapacityReservationStateActive,
+					ReservationType:       v1.CapacityReservationTypeDefault,
 				},
 			}
 			setReservationID := func(id string) {
 				out := awsEnv.EC2API.DescribeInstancesBehavior.Output.Clone()
+				out.Reservations[0].Instances[0].SpotInstanceRequestId = nil
 				out.Reservations[0].Instances[0].CapacityReservationId = lo.ToPtr(id)
+				out.Reservations[0].Instances[0].CapacityReservationSpecification = &ec2types.CapacityReservationSpecificationResponse{
+					CapacityReservationPreference: ec2types.CapacityReservationPreferenceCapacityReservationsOnly,
+				}
 				awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(out)
 			}
 			setReservationID("cr-foo")
@@ -928,6 +950,7 @@ var _ = Describe("CloudProvider", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(isDrifted).To(Equal(corecloudprovider.DriftReason("")))
 			setReservationID("cr-bar")
+			awsEnv.InstanceCache.Flush()
 			isDrifted, err = cloudProvider.IsDrifted(ctx, nodeClaim)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(isDrifted).To(Equal(cloudprovider.CapacityReservationDrift))
@@ -939,6 +962,11 @@ var _ = Describe("CloudProvider", func() {
 		})
 		It("should error if the NodeClaim doesn't have the instance-type label", func() {
 			delete(nodeClaim.Labels, corev1.LabelInstanceTypeStable)
+			_, err := cloudProvider.IsDrifted(ctx, nodeClaim)
+			Expect(err).To(HaveOccurred())
+		})
+		It("should error if the NodeClaim doesn't have ImageID", func() {
+			nodeClaim.Status.ImageID = ""
 			_, err := cloudProvider.IsDrifted(ctx, nodeClaim)
 			Expect(err).To(HaveOccurred())
 		})
@@ -966,10 +994,7 @@ var _ = Describe("CloudProvider", func() {
 					},
 				},
 			}
-			instance.ImageId = aws.String(armAMIID)
-			awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(&ec2.DescribeInstancesOutput{
-				Reservations: []ec2types.Reservation{{Instances: []ec2types.Instance{instance}}},
-			})
+			nodeClaim.Status.ImageID = armAMIID
 			ExpectApplied(ctx, env.Client, nodeClass)
 			isDrifted, err := cloudProvider.IsDrifted(ctx, nodeClaim)
 			Expect(err).ToNot(HaveOccurred())
@@ -1220,7 +1245,7 @@ var _ = Describe("CloudProvider", func() {
 				{SubnetId: aws.String("test-subnet-2"), AvailabilityZone: aws.String("test-zone-1a"), AvailabilityZoneId: aws.String("tstz1-1a"), AvailableIpAddressCount: aws.Int32(100),
 					Tags: []ec2types.Tag{{Key: aws.String("Name"), Value: aws.String("test-subnet-2")}}},
 			}})
-			controller := nodeclass.NewController(awsEnv.Clock, env.Client, cloudProvider, recorder, fake.DefaultRegion, awsEnv.SubnetProvider, awsEnv.SecurityGroupProvider, awsEnv.AMIProvider, awsEnv.InstanceProfileProvider, awsEnv.InstanceTypesProvider, awsEnv.LaunchTemplateProvider, awsEnv.CapacityReservationProvider, awsEnv.EC2API, awsEnv.ValidationCache, awsEnv.AMIResolver)
+			controller := nodeclass.NewController(awsEnv.Clock, env.Client, cloudProvider, recorder, fake.DefaultRegion, awsEnv.SubnetProvider, awsEnv.SecurityGroupProvider, awsEnv.AMIProvider, awsEnv.InstanceProfileProvider, awsEnv.InstanceTypesProvider, awsEnv.LaunchTemplateProvider, awsEnv.CapacityReservationProvider, awsEnv.EC2API, awsEnv.ValidationCache, awsEnv.RecreationCache, awsEnv.AMIResolver, options.FromContext(ctx).DisableDryRun)
 			ExpectApplied(ctx, env.Client, nodePool, nodeClass)
 			ExpectObjectReconciled(ctx, env.Client, controller, nodeClass)
 			pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-1a"}})
@@ -1237,7 +1262,7 @@ var _ = Describe("CloudProvider", func() {
 				{SubnetId: aws.String("test-subnet-2"), AvailabilityZone: aws.String("test-zone-1a"), AvailabilityZoneId: aws.String("tstz1-1a"), AvailableIpAddressCount: aws.Int32(11),
 					Tags: []ec2types.Tag{{Key: aws.String("Name"), Value: aws.String("test-subnet-2")}}},
 			}})
-			controller := nodeclass.NewController(awsEnv.Clock, env.Client, cloudProvider, recorder, fake.DefaultRegion, awsEnv.SubnetProvider, awsEnv.SecurityGroupProvider, awsEnv.AMIProvider, awsEnv.InstanceProfileProvider, awsEnv.InstanceTypesProvider, awsEnv.LaunchTemplateProvider, awsEnv.CapacityReservationProvider, awsEnv.EC2API, awsEnv.ValidationCache, awsEnv.AMIResolver)
+			controller := nodeclass.NewController(awsEnv.Clock, env.Client, cloudProvider, recorder, fake.DefaultRegion, awsEnv.SubnetProvider, awsEnv.SecurityGroupProvider, awsEnv.AMIProvider, awsEnv.InstanceProfileProvider, awsEnv.InstanceTypesProvider, awsEnv.LaunchTemplateProvider, awsEnv.CapacityReservationProvider, awsEnv.EC2API, awsEnv.ValidationCache, awsEnv.RecreationCache, awsEnv.AMIResolver, options.FromContext(ctx).DisableDryRun)
 			nodeClass.Spec.Kubelet = &v1.KubeletConfiguration{
 				MaxPods: aws.Int32(1),
 			}
@@ -1286,7 +1311,7 @@ var _ = Describe("CloudProvider", func() {
 			})
 			nodeClass.Spec.SubnetSelectorTerms = []v1.SubnetSelectorTerm{{Tags: map[string]string{"Name": "test-subnet-1"}}}
 			ExpectApplied(ctx, env.Client, nodePool, nodeClass)
-			controller := nodeclass.NewController(awsEnv.Clock, env.Client, cloudProvider, recorder, fake.DefaultRegion, awsEnv.SubnetProvider, awsEnv.SecurityGroupProvider, awsEnv.AMIProvider, awsEnv.InstanceProfileProvider, awsEnv.InstanceTypesProvider, awsEnv.LaunchTemplateProvider, awsEnv.CapacityReservationProvider, awsEnv.EC2API, awsEnv.ValidationCache, awsEnv.AMIResolver)
+			controller := nodeclass.NewController(awsEnv.Clock, env.Client, cloudProvider, recorder, fake.DefaultRegion, awsEnv.SubnetProvider, awsEnv.SecurityGroupProvider, awsEnv.AMIProvider, awsEnv.InstanceProfileProvider, awsEnv.InstanceTypesProvider, awsEnv.LaunchTemplateProvider, awsEnv.CapacityReservationProvider, awsEnv.EC2API, awsEnv.ValidationCache, awsEnv.RecreationCache, awsEnv.AMIResolver, options.FromContext(ctx).DisableDryRun)
 			ExpectObjectReconciled(ctx, env.Client, controller, nodeClass)
 			podSubnet1 := coretest.UnschedulablePod()
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, podSubnet1)
@@ -1414,25 +1439,30 @@ var _ = Describe("CloudProvider", func() {
 		})
 	})
 	Context("Capacity Reservations", func() {
-		var reservationID string
+		const reservationCapacity = 10
+		var crs []ec2types.CapacityReservation
 		BeforeEach(func() {
-			reservationID = "cr-m5.large-1a-1"
-			cr := ec2types.CapacityReservation{
-				AvailabilityZone:       lo.ToPtr("test-zone-1a"),
-				InstanceType:           lo.ToPtr("m5.large"),
-				OwnerId:                lo.ToPtr("012345678901"),
-				InstanceMatchCriteria:  ec2types.InstanceMatchCriteriaTargeted,
-				CapacityReservationId:  lo.ToPtr(reservationID),
-				AvailableInstanceCount: lo.ToPtr[int32](10),
-				State:                  ec2types.CapacityReservationStateActive,
-			}
-			awsEnv.CapacityReservationProvider.SetAvailableInstanceCount(reservationID, 10)
-			awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{
-				CapacityReservations: []ec2types.CapacityReservation{cr},
+			crs = lo.Map(v1.CapacityReservationType("").Values(), func(crt v1.CapacityReservationType, _ int) ec2types.CapacityReservation {
+				return ec2types.CapacityReservation{
+					AvailabilityZone:       lo.ToPtr("test-zone-1a"),
+					InstanceType:           lo.ToPtr("m5.large"),
+					OwnerId:                lo.ToPtr("012345678901"),
+					InstanceMatchCriteria:  ec2types.InstanceMatchCriteriaTargeted,
+					CapacityReservationId:  lo.ToPtr(fmt.Sprintf("cr-m5.large-1a-%s", string(crt))),
+					AvailableInstanceCount: lo.ToPtr[int32](reservationCapacity),
+					State:                  ec2types.CapacityReservationStateActive,
+					ReservationType:        ec2types.CapacityReservationType(crt),
+				}
 			})
-			nodeClass.Status.CapacityReservations = []v1.CapacityReservation{
-				lo.Must(nodeclass.CapacityReservationFromEC2(&cr)),
+			for _, cr := range crs {
+				awsEnv.CapacityReservationProvider.SetAvailableInstanceCount(*cr.CapacityReservationId, 10)
 			}
+			awsEnv.EC2API.DescribeCapacityReservationsOutput.Set(&ec2.DescribeCapacityReservationsOutput{
+				CapacityReservations: crs,
+			})
+			nodeClass.Status.CapacityReservations = lo.Map(crs, func(cr ec2types.CapacityReservation, _ int) v1.CapacityReservation {
+				return lo.Must(v1.CapacityReservationFromEC2(awsEnv.Clock, &cr))
+			})
 			nodePool.Spec.Template.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{{NodeSelectorRequirement: corev1.NodeSelectorRequirement{
 				Key:      karpv1.CapacityTypeLabelKey,
 				Operator: corev1.NodeSelectorOpIn,
@@ -1444,7 +1474,9 @@ var _ = Describe("CloudProvider", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClass, pod)
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
 			ExpectScheduled(ctx, env.Client, pod)
-			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(9))
+			ncs := ExpectNodeClaims(ctx, env.Client)
+			Expect(ncs).To(HaveLen(1))
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(ncs[0].Labels[corecloudprovider.ReservationIDLabel])).To(Equal(9))
 		})
 		It("should mark capacity reservations as terminated", func() {
 			pod := coretest.UnschedulablePod()
@@ -1457,24 +1489,38 @@ var _ = Describe("CloudProvider", func() {
 			// Attempt the first delete - since the instance still exists we shouldn't increment the availability count
 			err := cloudProvider.Delete(ctx, ncs[0])
 			Expect(corecloudprovider.IsNodeClaimNotFoundError(err)).To(BeFalse())
-			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(9))
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(ncs[0].Labels[corecloudprovider.ReservationIDLabel])).To(Equal(9))
 
 			// Attempt again after clearing the instance from the EC2 output. Now that we get a NotFound error, expect
 			// availability to be incremented.
 			awsEnv.EC2API.DescribeInstancesBehavior.Output.Set(&ec2.DescribeInstancesOutput{})
 			err = cloudProvider.Delete(ctx, ncs[0])
 			Expect(corecloudprovider.IsNodeClaimNotFoundError(err)).To(BeTrue())
-			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(reservationID)).To(Equal(10))
+			Expect(awsEnv.CapacityReservationProvider.GetAvailableInstanceCount(ncs[0].Labels[corecloudprovider.ReservationIDLabel])).To(Equal(10))
 		})
-		It("should include capacity reservation labels", func() {
-			pod := coretest.UnschedulablePod()
-			ExpectApplied(ctx, env.Client, nodePool, nodeClass, pod)
-			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
-			ExpectScheduled(ctx, env.Client, pod)
-			ncs := ExpectNodeClaims(ctx, env.Client)
-			Expect(ncs).To(HaveLen(1))
-			Expect(ncs[0].Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
-			Expect(ncs[0].Labels).To(HaveKeyWithValue(corecloudprovider.ReservationIDLabel, reservationID))
-		})
+		DescribeTable(
+			"should include capacity reservation labels",
+			func(crt v1.CapacityReservationType) {
+				pod := coretest.UnschedulablePod(coretest.PodOptions{
+					NodeSelector: map[string]string{
+						v1.LabelCapacityReservationType: string(crt),
+					},
+				})
+				ExpectApplied(ctx, env.Client, nodePool, nodeClass, pod)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				ncs := ExpectNodeClaims(ctx, env.Client)
+				Expect(ncs).To(HaveLen(1))
+				Expect(ncs[0].Labels).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeReserved))
+				Expect(ncs[0].Labels).To(HaveKeyWithValue(corecloudprovider.ReservationIDLabel, *lo.Must(lo.Find(crs, func(cr ec2types.CapacityReservation) bool {
+					return string(cr.ReservationType) == string(crt)
+
+				})).CapacityReservationId))
+				Expect(ncs[0].Labels).To(HaveKeyWithValue(v1.LabelCapacityReservationType, string(crt)))
+			},
+			lo.Map(v1.CapacityReservationType("").Values(), func(crt v1.CapacityReservationType, _ int) TableEntry {
+				return Entry(fmt.Sprintf("when the capacity reservation type is %q", string(crt)), crt)
+			}),
+		)
 	})
 })

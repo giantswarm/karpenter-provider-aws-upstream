@@ -30,6 +30,7 @@ const (
 	UnauthorizedOperationErrorCode                 = "UnauthorizedOperation"
 	RateLimitingErrorCode                          = "RequestLimitExceeded"
 	ServiceLinkedRoleCreationNotPermittedErrorCode = "AuthFailure.ServiceLinkedRoleCreationNotPermitted"
+	InsufficientFreeAddressesInSubnetErrorCode     = "InsufficientFreeAddressesInSubnet"
 )
 
 var (
@@ -149,6 +150,23 @@ func IgnoreRateLimitedError(err error) error {
 	return err
 }
 
+func IsServerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apiErr, ok := lo.ErrorsAs[smithy.APIError](err); ok {
+		return apiErr.ErrorFault() == smithy.FaultServer
+	}
+	return false
+}
+
+func IgnoreServerError(err error) error {
+	if IsServerError(err) {
+		return nil
+	}
+	return err
+}
+
 // IsUnfulfillableCapacity returns true if the Fleet err means capacity is temporarily unavailable for launching. This
 // could be due to account limits, insufficient ec2 capacity, etc.
 func IsUnfulfillableCapacity(err ec2types.CreateFleetError) bool {
@@ -157,6 +175,10 @@ func IsUnfulfillableCapacity(err ec2types.CreateFleetError) bool {
 
 func IsServiceLinkedRoleCreationNotPermitted(err ec2types.CreateFleetError) bool {
 	return *err.ErrorCode == ServiceLinkedRoleCreationNotPermittedErrorCode
+}
+
+func IsInsufficientFreeAddressesInSubnet(err ec2types.CreateFleetError) bool {
+	return *err.ErrorCode == InsufficientFreeAddressesInSubnetErrorCode
 }
 
 // IsReservationCapacityExceeded returns true if the fleet error means there is no remaining capacity for the provided
@@ -209,6 +231,9 @@ func ToReasonMessage(err error) (string, string) {
 	}
 	if strings.Contains(err.Error(), "InvalidAMIID.Malformed") {
 		return "InvalidAMIID", "AMI used for instance launch is invalid"
+	}
+	if strings.Contains(err.Error(), "InvalidAMIID.NotFound") {
+		return "AMINotFound", "AMI used for instance launch either does not exist or you don't have permissions to use it"
 	}
 	if strings.Contains(err.Error(), "RequestLimitExceeded") {
 		return "RequestLimitExceeded", "Request limit exceeded"

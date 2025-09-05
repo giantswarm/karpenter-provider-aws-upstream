@@ -21,6 +21,7 @@ HELM_OPTS ?= --set serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=${K
 			--set settings.featureGates.reservedCapacity=true \
 			--set settings.featureGates.spotToSpotConsolidation=true \
 			--set settings.preferencePolicy=Ignore \
+			--set logLevel=debug \
 			--create-namespace
 
 # CR for local builds of Karpenter
@@ -160,7 +161,6 @@ apply: verify image ## Deploy the controller from the current state of your git 
 	kubectl apply -f ./pkg/apis/crds/
 	helm upgrade --install karpenter charts/karpenter --namespace ${KARPENTER_NAMESPACE} \
         $(HELM_OPTS) \
-        --set logLevel=debug \
         --set controller.image.repository=$(IMG_REPOSITORY) \
         --set controller.image.tag=$(IMG_TAG) \
         --set controller.image.digest=$(IMG_DIGEST)
@@ -212,6 +212,15 @@ download: ## Recursively "go mod download" on all directories where go.mod exist
 update-karpenter: ## Update kubernetes-sigs/karpenter to latest
 	go get -u sigs.k8s.io/karpenter@HEAD
 	go mod tidy
+
+.PHONY: deploy-cfn
+deploy-cfn: ## Deploys the cloudformation stack defined in the docs preview directory
+	aws cloudformation deploy \
+		--stack-name "Karpenter-${CLUSTER_NAME}" \
+		--template-file "./website/content/en/preview/getting-started/getting-started-with-karpenter/cloudformation.yaml" \
+		--capabilities CAPABILITY_NAMED_IAM \
+		--parameter-overrides "ClusterName=${CLUSTER_NAME}"
+
 
 .PHONY: help presubmit ci-test ci-non-test run test deflake e2etests e2etests-deflake benchmark coverage verify vulncheck licenses image apply install delete docgen codegen stable-release-pr snapshot release prepare-website toolchain issues website tidy download update-karpenter
 

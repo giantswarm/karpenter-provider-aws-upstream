@@ -33,7 +33,7 @@ inputs:
     required: true
   k8s_version:
     description: 'Version of Kubernetes to use for the launched cluster'
-    default: "1.32"
+    default: "1.33"
   private_cluster:
     description: "Whether to create a private cluster which does not add access to the public internet. Valid values are 'true' or 'false'"
     default: 'false'
@@ -53,7 +53,7 @@ runs:
   using: "composite"
   steps:
   - name: login to ecr via docker
-    uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+    uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
     with:
       registry: ${{ inputs.account_id }}.dkr.ecr.${{ inputs.region }}.amazonaws.com
       logout: true
