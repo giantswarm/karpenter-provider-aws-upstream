@@ -103,7 +103,7 @@ var _ = BeforeSuite(func() {
 	fakeClock = &clock.FakeClock{}
 	recorder = events.NewRecorder(&record.FakeRecorder{})
 	cloudProvider = cloudprovider.New(awsEnv.InstanceTypesProvider, awsEnv.InstanceProvider, recorder,
-		env.Client, awsEnv.AMIProvider, awsEnv.SecurityGroupProvider, awsEnv.CapacityReservationProvider)
+		env.Client, awsEnv.AMIProvider, awsEnv.SecurityGroupProvider, awsEnv.CapacityReservationProvider, awsEnv.InstanceTypeStore)
 	cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
 	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
 })
@@ -1431,7 +1431,7 @@ var _ = Describe("LaunchTemplate Provider", func() {
 			Expect(awsEnv.EC2API.CreateLaunchTemplateBehavior.CalledWithInput.Len()).To(BeNumerically("==", 5))
 			ExpectLaunchTemplatesCreatedWithUserDataContaining(`
 [settings.bootstrap-commands.000-mount-instance-storage]
-commands = [['apiclient', 'ephemeral-storage', 'init'], ['apiclient', 'ephemeral-storage', 'bind', '--dirs', '/var/lib/containerd', '/var/lib/kubelet', '/var/log/pods']]
+commands = [['apiclient', 'ephemeral-storage', 'init'], ['apiclient', 'ephemeral-storage', 'bind']]
 mode = 'always'
 essential = true
 `)
@@ -1454,12 +1454,44 @@ essential = true
 			ExpectLaunchTemplatesCreatedWithUserDataContaining(`
 [settings.bootstrap-commands]
 [settings.bootstrap-commands.000-mount-instance-storage]
-commands = [['apiclient', 'ephemeral-storage', 'init'], ['apiclient', 'ephemeral-storage', 'bind', '--dirs', '/var/lib/containerd', '/var/lib/kubelet', '/var/log/pods']]
+commands = [['apiclient', 'ephemeral-storage', 'init'], ['apiclient', 'ephemeral-storage', 'bind']]
 mode = 'always'
 essential = true
 
 [settings.bootstrap-commands.111-say-hello]
 commands = [['echo', 'hello']]
+mode = 'always'
+essential = true
+`)
+		})
+		It("should use explicit directories for Bottlerocket v1.45.0", func() {
+			nodeClass.Spec.AMISelectorTerms = []v1.AMISelectorTerm{{Alias: "bottlerocket@v1.45.0"}}
+			nodeClass.Spec.InstanceStorePolicy = lo.ToPtr(v1.InstanceStorePolicyRAID0)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+			pod := coretest.UnschedulablePod()
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectScheduled(ctx, env.Client, pod)
+
+			Expect(awsEnv.EC2API.CreateLaunchTemplateBehavior.CalledWithInput.Len()).To(BeNumerically("==", 5))
+			ExpectLaunchTemplatesCreatedWithUserDataContaining(`
+[settings.bootstrap-commands.000-mount-instance-storage]
+commands = [['apiclient', 'ephemeral-storage', 'init'], ['apiclient', 'ephemeral-storage', 'bind', '--dirs', '/var/lib/containerd', '/var/lib/kubelet', '/var/log/pods']]
+mode = 'always'
+essential = true
+`)
+		})
+		It("should use default bind for Bottlerocket v1.46.0", func() {
+			nodeClass.Spec.AMISelectorTerms = []v1.AMISelectorTerm{{Alias: "bottlerocket@v1.46.0"}}
+			nodeClass.Spec.InstanceStorePolicy = lo.ToPtr(v1.InstanceStorePolicyRAID0)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+			pod := coretest.UnschedulablePod()
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectScheduled(ctx, env.Client, pod)
+
+			Expect(awsEnv.EC2API.CreateLaunchTemplateBehavior.CalledWithInput.Len()).To(BeNumerically("==", 5))
+			ExpectLaunchTemplatesCreatedWithUserDataContaining(`
+[settings.bootstrap-commands.000-mount-instance-storage]
+commands = [['apiclient', 'ephemeral-storage', 'init'], ['apiclient', 'ephemeral-storage', 'bind']]
 mode = 'always'
 essential = true
 `)
@@ -2288,6 +2320,42 @@ eviction-max-pod-grace-period = 10
 				Entry("AssociatePublicIPAddress is false (EFA)", false, false, true),
 			)
 		})
+		Context("IP Prefix Delegation", func() {
+			DescribeTable(
+				"should set 'IPv4PrefixCount' based on EC2NodeClass",
+				func(setValue int) {
+					nodeClass.Spec.IPPrefixCount = lo.ToPtr(int32(setValue))
+					awsEnv.LaunchTemplateProvider.ClusterIPFamily = corev1.IPv4Protocol
+					ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+					pod := coretest.UnschedulablePod()
+					ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+					ExpectScheduled(ctx, env.Client, pod)
+					input := awsEnv.EC2API.CreateLaunchTemplateBehavior.CalledWithInput.Pop()
+					Expect(*input.LaunchTemplateData.NetworkInterfaces[0].Ipv4PrefixCount).To(Equal(int32(setValue)))
+				},
+				Entry("IPv4PrefixCount is 0", 0),
+				Entry("IPv4PrefixCount is 1", 1),
+				Entry("IPv4PrefixCount is 10", 10),
+				Entry("IPv4PrefixCount is 100", 100),
+			)
+			DescribeTable(
+				"should set 'IPv6PrefixCount' based on EC2NodeClass",
+				func(setValue int) {
+					nodeClass.Spec.IPPrefixCount = lo.ToPtr(int32(setValue))
+					awsEnv.LaunchTemplateProvider.ClusterIPFamily = corev1.IPv6Protocol
+					ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+					pod := coretest.UnschedulablePod()
+					ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+					ExpectScheduled(ctx, env.Client, pod)
+					input := awsEnv.EC2API.CreateLaunchTemplateBehavior.CalledWithInput.Pop()
+					Expect(*input.LaunchTemplateData.NetworkInterfaces[0].Ipv6PrefixCount).To(Equal(int32(setValue)))
+				},
+				Entry("IPv6PrefixCount is 0", 0),
+				Entry("IPv6PrefixCount is 1", 1),
+				Entry("IPv6PrefixCount is 10", 10),
+				Entry("IPv6PrefixCount is 100", 100),
+			)
+		})
 		Context("Windows Custom UserData", func() {
 			BeforeEach(func() {
 				nodePool.Spec.Template.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{{NodeSelectorRequirement: corev1.NodeSelectorRequirement{Key: corev1.LabelOSStable, Operator: corev1.NodeSelectorOpIn, Values: []string{string(corev1.Windows)}}}}
@@ -2610,8 +2678,8 @@ func ExpectLaunchTemplatesCreatedWithUserData(expected string) {
 		userData, err := base64.StdEncoding.DecodeString(*input.LaunchTemplateData.UserData)
 		ExpectWithOffset(2, err).To(BeNil())
 		// Newlines are always added for missing TOML fields, so strip them out before comparisons.
-		actualUserData := strings.Replace(string(userData), "\n", "", -1)
-		expectedUserData := strings.Replace(expected, "\n", "", -1)
+		actualUserData := strings.ReplaceAll(string(userData), "\n", "")
+		expectedUserData := strings.ReplaceAll(expected, "\n", "")
 		ExpectWithOffset(2, actualUserData).To(Equal(expectedUserData))
 	})
 }
