@@ -76,8 +76,14 @@ cosign verify public.ecr.aws/karpenter/karpenter:1.8.1 \
 | podDisruptionBudget.maxUnavailable | int | `1` |  |
 | podDisruptionBudget.name | string | `"karpenter"` |  |
 | podLabels | object | `{}` | Additional labels for the pod. |
+| podLogs.enabled | bool | `false` | Specifies whether a PodLogs resource should be created for log collection. |
+| podLogs.tenant | string | `""` | The tenant name for routing logs to the correct Grafana organization. Must match a tenant configured in your observability platform. |
 | podSecurityContext | object | `{"fsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}}` | SecurityContext for the pod. |
 | priorityClassName | string | `"system-cluster-critical"` | PriorityClass name for the pod. |
+| proxy | object | `{"http":"","https":"","noProxy":""}` | HTTP proxy settings. |
+| proxy.http | string | `""` | HTTP proxy URL. |
+| proxy.https | string | `""` | HTTPS proxy URL. |
+| proxy.noProxy | string | `""` | Comma-separated list of hosts that should be excluded from proxying. |
 | replicas | int | `2` | Number of replicas. |
 | revisionHistoryLimit | int | `10` | The number of old ReplicaSets to retain to allow rollback. |
 | schedulerName | string | `"default-scheduler"` | Specify which Kubernetes scheduler should dispatch the pod. |
@@ -85,11 +91,7 @@ cosign verify public.ecr.aws/karpenter/karpenter:1.8.1 \
 | serviceAccount.annotations | object | `{}` | Additional annotations for the ServiceAccount. |
 | serviceAccount.create | bool | `true` | Specifies if a ServiceAccount should be created. |
 | serviceAccount.name | string | `""` | The name of the ServiceAccount to use. If not set and create is true, a name is generated using the fullname template. |
-| serviceMonitor.additionalLabels | object | `{}` | Additional labels for the ServiceMonitor. |
 | serviceMonitor.enabled | bool | `false` | Specifies whether a ServiceMonitor should be created. |
-| serviceMonitor.endpointConfig | object | `{}` | Configuration on `http-metrics` endpoint for the ServiceMonitor. Not to be used to add additional endpoints. See the Prometheus operator documentation for configurable fields https://github.com/prometheus-operator/prometheus-operator/blob/main/Documentation/api-reference/api.md#endpoint |
-| serviceMonitor.metricRelabelings | list | `[]` | Metric relabelings for the `http-metrics` endpoint on the ServiceMonitor. For more details on metric relabelings, see: https://prometheus.io/docs/prometheus/latest/configuration/configuration/#metric_relabel_configs |
-| serviceMonitor.relabelings | list | `[]` | Relabelings for the `http-metrics` endpoint on the ServiceMonitor. For more details on relabelings, see: https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config |
 | settings | object | `{"batchIdleDuration":"1s","batchMaxDuration":"10s","clusterCABundle":"","clusterEndpoint":"","clusterName":"","disableClusterStateObservability":false,"disableDryRun":false,"eksControlPlane":false,"featureGates":{"nodeOverlay":false,"nodeRepair":false,"reservedCapacity":true,"spotToSpotConsolidation":false,"staticCapacity":false},"ignoreDRARequests":true,"interruptionQueue":"","isolatedVPC":false,"minValuesPolicy":"Strict","preferencePolicy":"Respect","reservedENIs":"0","vmMemoryOverheadPercent":0.075}` | Global Settings to configure Karpenter |
 | settings.batchIdleDuration | string | `"1s"` | The maximum amount of time with no new ending pods that if exceeded ends the current batching window. If pods arrive faster than this time, the batching window will be extended up to the maxDuration. If they arrive slower, the pods will be batched separately. |
 | settings.batchMaxDuration | string | `"10s"` | The maximum length of a batch window. The longer this is, the more pods we can consider for provisioning at one time which usually results in fewer but larger nodes. |
