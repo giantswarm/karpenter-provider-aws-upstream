@@ -223,3 +223,12 @@ settings:
     # -- staticCapacity is ALPHA and is disabled by default.
     # Setting this to true will enable static capacity provisioning.
     staticCapacity: false
+
+# -- HTTP proxy settings.
+proxy:
+  # -- HTTP proxy URL.
+  http: ""
+  # -- HTTPS proxy URL.
+  https: ""
+  # -- Comma-separated list of hosts that should be excluded from proxying.
+  noProxy: ""
